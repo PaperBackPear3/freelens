@@ -372,19 +372,11 @@ const FileExplorerDialog: React.FC<{
         }}
       >
         <h3 style={{ margin: 0, color: "var(--dialogTextColor)" }}>File Explorer</h3>
-        <button
+        <Button
           onClick={onClose}
-          style={{
-            background: "none",
-            border: "none",
-            fontSize: "20px",
-            cursor: "pointer",
-            padding: "0",
-            color: "var(--textColorPrimary)",
-          }}
-        >
-          ✕
-        </button>
+          label="✕"
+        />
+          
       </div>
 
       <div
@@ -447,7 +439,6 @@ const FileExplorerDialog: React.FC<{
 
 const NonInjectablePodFileExplorerMenu: React.FC<PodFileExplorerMenuProps & Dependencies> = (props) => {
   const { object, toolbar, execFile, hostedClusterId, getClusterById } = props;
-  const [showExplorer, setShowExplorer] = useState(false);
   const [selectedContainer, setSelectedContainer] = useState<Container | EphemeralContainer | null>(null);
 
   if (!object) return null;
@@ -476,36 +467,19 @@ const NonInjectablePodFileExplorerMenu: React.FC<PodFileExplorerMenuProps & Depe
         statuses={pod.getContainerStatuses()}
         onMenuItemClick={(container) => {
           setSelectedContainer(container);
-          setShowExplorer(true);
         }}
       />
 
-      {showExplorer && selectedContainer && (
+      {  selectedContainer && (
         <>
           <FileExplorerDialog
             pod={pod}
             container={selectedContainer}
             onClose={() => {
-              setShowExplorer(false);
               setSelectedContainer(null);
             }}
             execFile={execFile}
             cluster={cluster}
-          />
-          <div
-            onClick={() => {
-              setShowExplorer(false);
-              setSelectedContainer(null);
-            }}
-            style={{
-              position: "fixed",
-              top: 0,
-              left: 0,
-              right: 0,
-              bottom: 0,
-              background: "rgba(0, 0, 0, 0.3)",
-              zIndex: 9999,
-            }}
           />
         </>
       )}
