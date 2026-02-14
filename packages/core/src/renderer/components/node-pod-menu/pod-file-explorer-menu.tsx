@@ -7,14 +7,15 @@
 import { Pod } from "@freelensapp/kube-object";
 import { withInjectables } from "@ogre-tools/injectable-react";
 import React, { useState } from "react";
+import execFileInjectable, { type ExecFile } from "../../../common/fs/exec-file.injectable";
+import type { Cluster } from "../../../common/cluster/cluster";
 import { App } from "../../../extensions/common-api";
-import createTerminalTabInjectable from "../dock/terminal/create-terminal-tab.injectable";
-import sendCommandInjectable, { type SendCommand } from "../dock/terminal/send-command.injectable";
-import hideDetailsInjectable, { type HideDetails } from "../kube-detail-params/hide-details.injectable";
+import hostedClusterIdInjectable from "../../cluster-frame-context/hosted-cluster-id.injectable";
+import getClusterByIdInjectable, { type GetClusterById } from "../../../features/cluster/storage/common/get-by-id.injectable";
 import PodMenuItem from "./pod-menu-item";
+import { Button } from "@freelensapp/button";
 
 import type { Container, EphemeralContainer } from "@freelensapp/kube-object";
-import type { DockTabCreateSpecific } from "../dock/dock/store";
 
 export interface PodFileExplorerMenuProps {
   object: any;
@@ -22,9 +23,9 @@ export interface PodFileExplorerMenuProps {
 }
 
 interface Dependencies {
-  createTerminalTab: (tabParams: DockTabCreateSpecific) => void;
-  sendCommand: SendCommand;
-  hideDetails: HideDetails;
+  execFile: ExecFile;
+  hostedClusterId: string | undefined;
+  getClusterById: GetClusterById;
 }
 
 interface FileEntry {
@@ -38,6 +39,7 @@ interface FileEntry {
   loading?: boolean;
 }
 
+
 const FileTreeNode: React.FC<{
   entry: FileEntry;
   level: number;
@@ -45,8 +47,6 @@ const FileTreeNode: React.FC<{
   onDownloadFile: (path: string) => void;
   onLoadChildren: (path: string) => void;
 }> = ({ entry, level, onToggleExpand, onDownloadFile, onLoadChildren }) => {
-  const hasChildren = entry.isDirectory && (entry.children === undefined || entry.children.length > 0);
-
   return (
     <>
       <div
@@ -55,33 +55,29 @@ const FileTreeNode: React.FC<{
           display: "flex",
           alignItems: "center",
           padding: "6px 8px",
-          borderBottom: "1px solid #f0f0f0",
-          hoverStyle: entry.isDirectory ? "background: #f9f9f9" : "none",
+          borderBottom: "1px solid var(--borderFaintColor)",
+        }}
+        onMouseEnter={(e) => {
+          if (entry.isDirectory) e.currentTarget.style.background = "var(--menuActiveBackground)";
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.background = "transparent";
         }}
       >
         {entry.isDirectory ? (
-          <button
+          <Button
             onClick={() => {
               if (!entry.expanded && !entry.children) {
                 onLoadChildren(entry.path);
               }
               onToggleExpand(entry.path);
             }}
-            style={{
-              background: "none",
-              border: "none",
-              cursor: "pointer",
-              padding: "0 4px",
-              fontSize: "12px",
-              width: "20px",
-              height: "20px",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}
+            plain
+            aria-label={entry.expanded ? "Collapse folder" : "Expand folder"}
+            style={{ padding: "0 4px", minWidth: "20px", height: "20px" }}
           >
             {entry.loading ? "⏳" : entry.expanded ? "▼" : "▶"}
-          </button>
+          </Button>
         ) : (
           <div style={{ width: "20px" }}></div>
         )}
@@ -90,32 +86,31 @@ const FileTreeNode: React.FC<{
           {entry.isDirectory ? "📁" : "📄"}
         </span>
 
-        <span style={{ flex: 1, fontSize: "13px", fontFamily: "monospace" }}>
+        <span style={{ flex: 1, fontSize: "13px", fontFamily: "monospace", color: "var(--textColorPrimary)" }}>
           {entry.name}
         </span>
 
         {entry.size && (
-          <span style={{ fontSize: "11px", color: "#999", marginRight: "12px", minWidth: "60px", textAlign: "right" }}>
+          <span
+            style={{
+              fontSize: "11px",
+              color: "var(--textColorTertiary)",
+              marginRight: "12px",
+              minWidth: "60px",
+              textAlign: "right",
+            }}
+          >
             {(entry.size / 1024).toFixed(1)} KB
           </span>
         )}
 
         {!entry.isDirectory && (
-          <button
+          <Button
             onClick={() => onDownloadFile(entry.path)}
-            style={{
-              background: "#4CAF50",
-              color: "white",
-              border: "none",
-              padding: "4px 12px",
-              borderRadius: "3px",
-              cursor: "pointer",
-              fontSize: "11px",
-              marginLeft: "8px",
-            }}
-          >
-            Download
-          </button>
+            primary
+            label="Download"
+            style={{ marginLeft: "8px", fontSize: "11px" }}
+          />
         )}
       </div>
 
@@ -141,61 +136,132 @@ const FileExplorerDialog: React.FC<{
   pod: Pod;
   container: Container | EphemeralContainer;
   onClose: () => void;
-  sendCommand: SendCommand;
-  createTerminalTab: (tabParams: DockTabCreateSpecific) => void;
-  hideDetails: HideDetails;
-}> = ({ pod, container, onClose, sendCommand, createTerminalTab, hideDetails }) => {
+  execFile: ExecFile;
+  cluster?: Cluster;
+}> = ({ pod, container, onClose, execFile, cluster }) => {
   const [rootFiles, setRootFiles] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const kubectlPath = App.Preferences.getKubectlPath() || "kubectl";
 
-  React.useEffect(() => {
-    loadFilesAtPath("/");
-  }, []);
-
   const parseListOutput = (output: string, basePath: string): FileEntry[] => {
+    if (!output || typeof output !== "string") return [];
+
     return output
       .split("\n")
-      .filter((line) => line.trim().length > 0 && !line.startsWith("total"))
-      .map((line) => {
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith("total"))
+      .map((line): FileEntry | null => {
         const parts = line.split(/\s+/);
-        if (parts.length < 9) return null;
+
+        if (parts.length < 9) {
+          return null;
+        }
 
         const permissions = parts[0];
-        const size = parseInt(parts[4], 10);
         const name = parts.slice(8).join(" ");
         const isDirectory = permissions.startsWith("d");
+        const size = parseInt(parts[4], 10);
         const fullPath = basePath === "/" ? `/${name}` : `${basePath}/${name}`;
+
+        if (name === "." || name === "..") {
+          return null;
+        }
 
         return {
           name,
           path: fullPath,
           isDirectory,
-          size: isDirectory ? undefined : size,
+          size: isDirectory ? undefined : Number.isNaN(size) ? undefined : size,
           permissions,
           expanded: false,
           children: isDirectory ? [] : undefined,
         };
       })
-      .filter((entry): entry is FileEntry => entry !== null);
+      .filter((entry): entry is FileEntry => Boolean(entry));
   };
 
-  const loadFilesAtPath = async (path: string) => {
+  const execKubectl = React.useCallback(
+    async (args: string[]) => {
+      if (!cluster) {
+        throw new Error("Cluster not available. Ensure the cluster is connected.");
+      }
+
+      const result = await execFile(kubectlPath, args);
+
+      if (!result.callWasSuccessful) {
+        const message = result.error?.stderr || result.error?.message || "Failed to run kubectl";
+
+        throw new Error(message);
+      }
+
+      return result.response;
+    },
+    [cluster, execFile, kubectlPath],
+  );
+
+  const buildKubectlArgs = React.useCallback(
+    (commandArgs: string[]) => {
+      const args: string[] = [];
+      const kubeconfigPath = cluster?.kubeConfigPath.get();
+      const contextName = cluster?.contextName.get();
+
+      if (kubeconfigPath) {
+        args.push("--kubeconfig", kubeconfigPath);
+      }
+
+      if (contextName) {
+        args.push("--context", contextName);
+      }
+
+      return [...args, ...commandArgs];
+    },
+    [cluster],
+  );
+
+  const listFilesAtPath = React.useCallback(
+    async (path: string) => {
+      const safePath = path.replace(/"/g, "\\\"");
+      const command = `ls -la -- "${safePath}"`;
+      const args = buildKubectlArgs([
+        "exec",
+        "-i",
+        "-n",
+        pod.getNs(),
+        pod.getName(),
+        "-c",
+        container.name,
+        "--",
+        "sh",
+        "-c",
+        command,
+      ]);
+      const output = await execKubectl(args);
+
+      return parseListOutput(output, path);
+    },
+    [buildKubectlArgs, container.name, execKubectl, pod],
+  );
+
+  const loadRootFiles = React.useCallback(async () => {
     setLoading(true);
     setError(null);
 
     try {
-      const command = `${kubectlPath} exec -i -n ${pod.getNs()} ${pod.getName()} -c ${container.name} -- ls -lah "${path}" 2>&1`;
-      const output = await sendCommand(command, { enter: true });
-      const files = parseListOutput(output as string, path);
+      const files = await listFilesAtPath("/");
+
       setRootFiles(files);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load files");
+      setRootFiles([]);
     } finally {
       setLoading(false);
     }
-  };
+  }, [listFilesAtPath]);
+
+  React.useEffect(() => {
+    void loadRootFiles();
+  }, [loadRootFiles]);
 
   const toggleExpand = (path: string) => {
     const updateFiles = (files: FileEntry[]): FileEntry[] => {
@@ -209,7 +275,7 @@ const FileExplorerDialog: React.FC<{
         return file;
       });
     };
-    setRootFiles(updateFiles(rootFiles));
+    setRootFiles((current) => updateFiles(current));
   };
 
   const loadChildren = async (path: string) => {
@@ -224,13 +290,10 @@ const FileExplorerDialog: React.FC<{
         return file;
       });
     };
-    setRootFiles(updateFiles(rootFiles));
+    setRootFiles((current) => updateFiles(current));
 
     try {
-      const escapedPath = path.replace(/"/g, '\\"');
-      const command = `${kubectlPath} exec -i -n ${pod.getNs()} ${pod.getName()} -c ${container.name} -- ls -lah "${escapedPath}" 2>&1`;
-      const output = await sendCommand(command, { enter: true });
-      const children = parseListOutput(output as string, path);
+      const children = await listFilesAtPath(path);
 
       const updateFilesWithChildren = (files: FileEntry[]): FileEntry[] => {
         return files.map((file) => {
@@ -243,7 +306,7 @@ const FileExplorerDialog: React.FC<{
           return file;
         });
       };
-      setRootFiles(updateFilesWithChildren(rootFiles));
+      setRootFiles((current) => updateFilesWithChildren(current));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load directory");
       const updateFilesOnError = (files: FileEntry[]): FileEntry[] => {
@@ -257,7 +320,7 @@ const FileExplorerDialog: React.FC<{
           return file;
         });
       };
-      setRootFiles(updateFilesOnError(rootFiles));
+      setRootFiles((current) => updateFilesOnError(current));
     }
   };
 
@@ -265,44 +328,50 @@ const FileExplorerDialog: React.FC<{
     const fileName = filePath.split("/").pop() || "download";
     const downloadDir = `${process.env.HOME || "~"}/Downloads`;
 
-    const command = `${kubectlPath} cp ${pod.getNs()}/${pod.getName()}:${filePath} ${downloadDir}/${fileName} -c ${container.name}`;
-
-    createTerminalTab({
-      title: `Download: ${fileName}`,
-      id: `download-${Date.now()}`,
-    });
-
     try {
-      await sendCommand(command, { enter: true });
+      const args = buildKubectlArgs([
+        "cp",
+        "-c",
+        container.name,
+        `${pod.getNs()}/${pod.getName()}:${filePath}`,
+        `${downloadDir}/${fileName}`,
+      ]);
+
+      await execKubectl(args);
       alert(`File downloaded to ~/Downloads/${fileName}`);
     } catch (err) {
       alert(`Download failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-
-    hideDetails();
   };
 
   return (
     <div
       style={{
         position: "fixed",
-        top: "50%",
-        left: "50%",
-        transform: "translate(-50%, -50%)",
-        background: "white",
-        border: "1px solid #ccc",
-        borderRadius: "8px",
-        padding: "20px",
+        left: 0,
+        top: 0,
+        bottom: 0,
+        width: "450px",
+        background: "var(--dialogBackground)",
+        borderRight: "1px solid var(--borderColor)",
         zIndex: 10000,
-        boxShadow: "0 8px 24px rgba(0, 0, 0, 0.15)",
-        minWidth: "650px",
-        maxHeight: "85vh",
         display: "flex",
         flexDirection: "column",
+        boxShadow: "var(--boxShadow)",
       }}
     >
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
-        <h3 style={{ margin: 0 }}>File Explorer</h3>
+      <div
+        style={{
+          padding: "16px",
+          borderBottom: "1px solid var(--borderFaintColor)",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          background: "var(--dialogHeaderBackground)",
+          color: "var(--dialogTextColor)",
+        }}
+      >
+        <h3 style={{ margin: 0, color: "var(--dialogTextColor)" }}>File Explorer</h3>
         <button
           onClick={onClose}
           style={{
@@ -311,29 +380,50 @@ const FileExplorerDialog: React.FC<{
             fontSize: "20px",
             cursor: "pointer",
             padding: "0",
+            color: "var(--textColorPrimary)",
           }}
         >
           ✕
         </button>
       </div>
 
-      <div style={{ marginBottom: "12px", fontSize: "12px", color: "#666" }}>
-        <strong>Pod:</strong> {pod.getName()} | <strong>Namespace:</strong> {pod.getNs()} | <strong>Container:</strong> {container.name}
+      <div
+        style={{
+          padding: "12px 16px",
+          fontSize: "12px",
+          color: "var(--textColorSecondary)",
+          borderBottom: "1px solid var(--borderFaintColor)",
+          background: "var(--dialogHeaderBackground)",
+        }}
+      >
+        <div><strong>Pod:</strong> {pod.getName()}</div>
+        <div><strong>Namespace:</strong> {pod.getNs()}</div>
+        <div><strong>Container:</strong> {container.name}</div>
       </div>
 
       {error && (
-        <div style={{ marginBottom: "12px", padding: "8px", background: "#ffebee", color: "#c62828", borderRadius: "4px", fontSize: "12px" }}>
+        <div
+          style={{
+            margin: "12px",
+            padding: "8px",
+            background: "var(--colorSoftError)",
+            color: "var(--colorError)",
+            borderRadius: "4px",
+            fontSize: "12px",
+            border: "1px solid var(--colorError)",
+          }}
+        >
           Error: {error}
         </div>
       )}
 
-      <div style={{ flex: 1, overflow: "auto", border: "1px solid #e0e0e0", borderRadius: "4px", background: "#fafafa" }}>
+      <div style={{ flex: 1, overflow: "auto", background: "var(--contentColor)" }}>
         {loading ? (
-          <div style={{ padding: "20px", textAlign: "center", color: "#999" }}>
+          <div style={{ padding: "20px", textAlign: "center", color: "var(--textColorTertiary)" }}>
             Loading files...
           </div>
         ) : rootFiles.length === 0 ? (
-          <div style={{ padding: "20px", textAlign: "center", color: "#999" }}>
+          <div style={{ padding: "20px", textAlign: "center", color: "var(--textColorTertiary)" }}>
             No files found
           </div>
         ) : (
@@ -351,28 +441,12 @@ const FileExplorerDialog: React.FC<{
           </div>
         )}
       </div>
-
-      <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end", marginTop: "12px" }}>
-        <button
-          onClick={onClose}
-          style={{
-            padding: "8px 16px",
-            background: "#f0f0f0",
-            border: "1px solid #ccc",
-            borderRadius: "4px",
-            cursor: "pointer",
-            fontSize: "14px",
-          }}
-        >
-          Close
-        </button>
-      </div>
     </div>
   );
 };
 
 const NonInjectablePodFileExplorerMenu: React.FC<PodFileExplorerMenuProps & Dependencies> = (props) => {
-  const { object, toolbar, createTerminalTab, sendCommand, hideDetails } = props;
+  const { object, toolbar, execFile, hostedClusterId, getClusterById } = props;
   const [showExplorer, setShowExplorer] = useState(false);
   const [selectedContainer, setSelectedContainer] = useState<Container | EphemeralContainer | null>(null);
 
@@ -387,14 +461,9 @@ const NonInjectablePodFileExplorerMenu: React.FC<PodFileExplorerMenuProps & Depe
   }
 
   const containers = pod.getRunningContainersWithType();
-  const statuses = pod.getContainerStatuses();
 
   if (!containers || !containers.length) return null;
-
-  const handleOpenExplorer = (container: Container | EphemeralContainer) => {
-    setSelectedContainer(container);
-    setShowExplorer(true);
-  };
+  const cluster = hostedClusterId ? getClusterById(hostedClusterId) : undefined;
 
   return (
     <>
@@ -404,8 +473,11 @@ const NonInjectablePodFileExplorerMenu: React.FC<PodFileExplorerMenuProps & Depe
         tooltip="File Explorer"
         toolbar={toolbar}
         containers={containers}
-        statuses={statuses}
-        onMenuItemClick={handleOpenExplorer}
+        statuses={pod.getContainerStatuses()}
+        onMenuItemClick={(container) => {
+          setSelectedContainer(container);
+          setShowExplorer(true);
+        }}
       />
 
       {showExplorer && selectedContainer && (
@@ -417,9 +489,8 @@ const NonInjectablePodFileExplorerMenu: React.FC<PodFileExplorerMenuProps & Depe
               setShowExplorer(false);
               setSelectedContainer(null);
             }}
-            sendCommand={sendCommand}
-            createTerminalTab={createTerminalTab}
-            hideDetails={hideDetails}
+            execFile={execFile}
+            cluster={cluster}
           />
           <div
             onClick={() => {
@@ -432,7 +503,7 @@ const NonInjectablePodFileExplorerMenu: React.FC<PodFileExplorerMenuProps & Depe
               left: 0,
               right: 0,
               bottom: 0,
-              background: "rgba(0, 0, 0, 0.5)",
+              background: "rgba(0, 0, 0, 0.3)",
               zIndex: 9999,
             }}
           />
@@ -447,9 +518,9 @@ export const PodFileExplorerMenu = withInjectables<Dependencies, PodFileExplorer
   {
     getProps: (di, props) => ({
       ...props,
-      createTerminalTab: di.inject(createTerminalTabInjectable),
-      sendCommand: di.inject(sendCommandInjectable),
-      hideDetails: di.inject(hideDetailsInjectable),
+      execFile: di.inject(execFileInjectable),
+      hostedClusterId: di.inject(hostedClusterIdInjectable),
+      getClusterById: di.inject(getClusterByIdInjectable),
     }),
   }
 );
